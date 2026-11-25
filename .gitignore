@@ -1,0 +1,16 @@
+.venv/
+node_modules/
+dist/
+__pycache__/
+*.py[cod]
+*.log
+.vite/
+.env
+.env.*
+!.env.example
+*.pdf
+*.docx
+uploads/
+/qa/
+/design-qa.md
+/AGENTS.md

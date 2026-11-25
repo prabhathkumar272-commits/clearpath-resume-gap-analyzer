@@ -1,0 +1,9 @@
+Sample Candidate (fictional demo profile)
+Junior data analyst
+
+Skills: Python, SQL, pandas, data analysis, communication, Git.
+
+Experience
+- Used Python and pandas to clean weekly customer data.
+- Wrote SQL queries and shared simple findings with product teammates.
+- Collaborated on small analytics projects using Git.
