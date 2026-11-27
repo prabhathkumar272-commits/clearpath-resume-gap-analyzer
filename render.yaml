@@ -1,0 +1,36 @@
+services:
+  - type: web
+    name: clearpath-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn api.main:app --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --workers ${WEB_CONCURRENCY:-2} --timeout 60 --access-logfile - --error-logfile -
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: FRONTEND_ORIGINS
+        sync: false
+      - key: CLEARPATH_MAX_UPLOAD_BYTES
+        value: "10485760"
+      - key: CLEARPATH_MAX_JOB_DESCRIPTION_CHARS
+        value: "20000"
+      - key: CLEARPATH_RATE_LIMIT_REQUESTS
+        value: "12"
+      - key: CLEARPATH_RATE_LIMIT_WINDOW_SECONDS
+        value: "60"
+      - key: CLEARPATH_SEMANTIC_MATCHING
+        value: "false"
+
+  - type: web
+    name: clearpath-web
+    runtime: static
+    buildCommand: npm ci && npm run build
+    staticPublishPath: dist/client
+    envVars:
+      - key: VITE_API_BASE_URL
+        sync: false
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html

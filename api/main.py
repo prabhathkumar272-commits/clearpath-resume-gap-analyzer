@@ -1,19 +1,52 @@
 from __future__ import annotations
 
 import io
+import logging
 import os
 import re
 import importlib.util
+import time
+from collections import defaultdict, deque
 from functools import lru_cache
+from threading import Lock
 from typing import Annotated
 
 from docx import Document
-from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pypdf import PdfReader
 
-MAX_FILE_BYTES = 10 * 1024 * 1024
+
+def positive_int_env(name: str, default: int, minimum: int = 1, maximum: int | None = None) -> int:
+    """Read bounded numeric settings without making deployment fail on a malformed value."""
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    if value < minimum:
+        return default
+    if maximum is not None and value > maximum:
+        return maximum
+    return value
+
+
+MAX_FILE_BYTES = positive_int_env("CLEARPATH_MAX_UPLOAD_BYTES", 10 * 1024 * 1024, minimum=1024, maximum=25 * 1024 * 1024)
 MIN_JOB_DESCRIPTION = 60
+MAX_JOB_DESCRIPTION_CHARS = positive_int_env("CLEARPATH_MAX_JOB_DESCRIPTION_CHARS", 20_000, minimum=MIN_JOB_DESCRIPTION, maximum=100_000)
+RATE_LIMIT_REQUESTS = positive_int_env("CLEARPATH_RATE_LIMIT_REQUESTS", 12, maximum=300)
+RATE_LIMIT_WINDOW_SECONDS = positive_int_env("CLEARPATH_RATE_LIMIT_WINDOW_SECONDS", 60, maximum=3600)
+MAX_REQUEST_BYTES = MAX_FILE_BYTES + MAX_JOB_DESCRIPTION_CHARS + 1024 * 1024
+ALLOWED_EXTENSIONS = {"pdf", "docx", "txt"}
+ALLOWED_CONTENT_TYPES = {
+    "pdf": {"application/pdf", "application/octet-stream"},
+    "docx": {"application/vnd.openxmlformats-officedocument.wordprocessingml.document", "application/octet-stream", "application/zip"},
+    "txt": {"text/plain", "application/octet-stream"},
+}
+logger = logging.getLogger("clearpath")
+rate_limit_buckets: dict[str, deque[float]] = defaultdict(deque)
+rate_limit_lock = Lock()
 
 # A transparent skill vocabulary makes this first version useful without a
 # downloaded NLP model. Add aliases here as real user feedback comes in.
@@ -145,17 +178,108 @@ def semantic_model():
 
     return SentenceTransformer(os.getenv("CLEARPATH_SEMANTIC_MODEL", "sentence-transformers/all-MiniLM-L6-v2"))
 
-app = FastAPI(title="Clearpath Resume Gap Analyzer", version="0.1.0")
+app = FastAPI(title="Clearpath Resume Gap Analyzer", version="0.1.0", docs_url="/docs", redoc_url=None)
+configured_origins = [origin.strip().rstrip("/") for origin in os.getenv("FRONTEND_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174").split(",") if origin.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:5174", "http://127.0.0.1:5174"],
+    allow_origins=configured_origins,
     allow_methods=["GET", "POST"],
-    allow_headers=["*"],
+    allow_headers=["Content-Type"],
+    max_age=600,
 )
 
 
-def read_resume(filename: str, content: bytes) -> str:
-    extension = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+def client_identifier(request: Request) -> str:
+    """Use the forwarding header supplied by the hosting proxy when it is available."""
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",", 1)[0].strip() or "unknown"
+    return request.client.host if request.client else "unknown"
+
+
+def consume_rate_limit(client_id: str) -> int | None:
+    """Return retry seconds when a client exceeded the local per-instance limit."""
+    now = time.monotonic()
+    with rate_limit_lock:
+        bucket = rate_limit_buckets[client_id]
+        while bucket and now - bucket[0] >= RATE_LIMIT_WINDOW_SECONDS:
+            bucket.popleft()
+        if len(bucket) >= RATE_LIMIT_REQUESTS:
+            return max(1, int(RATE_LIMIT_WINDOW_SECONDS - (now - bucket[0])) + 1)
+        bucket.append(now)
+    return None
+
+
+def apply_cors_for_early_response(request: Request, response: JSONResponse) -> JSONResponse:
+    """Rate-limit responses still need CORS headers so the UI can show a useful message."""
+    origin = request.headers.get("origin", "").rstrip("/")
+    if origin in configured_origins:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "same-origin"
+    response.headers["Cache-Control"] = "no-store, private"
+    return response
+
+
+@app.middleware("http")
+async def production_safety_headers(request: Request, call_next):
+    if request.method == "POST" and request.url.path == "/api/analyze":
+        content_length = request.headers.get("content-length")
+        if content_length and content_length.isdigit() and int(content_length) > MAX_REQUEST_BYTES:
+            return apply_cors_for_early_response(request, JSONResponse(status_code=413, content={"detail": "The request is too large. Choose a resume under the upload limit."}))
+        retry_after = consume_rate_limit(client_identifier(request))
+        if retry_after:
+            return apply_cors_for_early_response(request, JSONResponse(
+                status_code=429,
+                content={"detail": "Too many analyses from this connection. Please wait a moment and try again."},
+                headers={"Retry-After": str(retry_after)},
+            ))
+
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "same-origin"
+    response.headers["Cache-Control"] = "no-store, private"
+    return response
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(_: Request, __: RequestValidationError) -> JSONResponse:
+    return JSONResponse(status_code=422, content={"detail": "Check the resume file and job description, then try again."})
+
+
+@app.exception_handler(Exception)
+async def unexpected_error_handler(_: Request, exc: Exception) -> JSONResponse:
+    logger.exception("Unexpected request failure: %s", type(exc).__name__)
+    return JSONResponse(status_code=500, content={"detail": "The analysis service had a temporary problem. Please try again."})
+
+
+def resume_extension(filename: str) -> str:
+    return filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+
+
+def validate_resume_upload(filename: str, content_type: str | None, content: bytes) -> str:
+    extension = resume_extension(filename)
+    if extension not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=415, detail="Choose a PDF, DOCX, or TXT resume.")
+    if content_type and content_type.lower() not in ALLOWED_CONTENT_TYPES[extension]:
+        raise HTTPException(status_code=415, detail="The file type does not match its extension. Choose a PDF, DOCX, or TXT resume.")
+    if extension == "pdf" and b"%PDF-" not in content[:1024]:
+        raise HTTPException(status_code=422, detail="That PDF file could not be verified. Export it as a text-based PDF and try again.")
+    if extension == "docx" and not content.startswith(b"PK"):
+        raise HTTPException(status_code=422, detail="That DOCX file could not be verified. Export it again and try once more.")
+    if extension == "txt" and b"\x00" in content[:4096]:
+        raise HTTPException(status_code=422, detail="That text file could not be read. Choose a UTF-8 TXT resume.")
+    return extension
+
+
+def validate_upload_size(content: bytes) -> None:
+    if len(content) > MAX_FILE_BYTES:
+        raise HTTPException(status_code=413, detail="That file is over 10 MB. Choose a smaller resume to continue.")
+
+
+def read_resume(filename: str, content: bytes, extension: str | None = None) -> str:
+    extension = extension or resume_extension(filename)
     try:
         if extension == "pdf":
             reader = PdfReader(io.BytesIO(content))
@@ -346,11 +470,13 @@ async def analyze_resume(
         raise HTTPException(status_code=400, detail="Choose a resume file to continue.")
     if len(job_description.strip()) < MIN_JOB_DESCRIPTION:
         raise HTTPException(status_code=400, detail=f"Add at least {MIN_JOB_DESCRIPTION} characters of job description.")
+    if len(job_description) > MAX_JOB_DESCRIPTION_CHARS:
+        raise HTTPException(status_code=413, detail="That job description is too long. Keep it under the configured character limit and try again.")
     content = await resume.read(MAX_FILE_BYTES + 1)
     await resume.close()
-    if len(content) > MAX_FILE_BYTES:
-        raise HTTPException(status_code=413, detail="That file is over 10 MB. Choose a smaller resume to continue.")
-    resume_text = read_resume(resume.filename, content)
+    validate_upload_size(content)
+    extension = validate_resume_upload(resume.filename, resume.content_type, content)
+    resume_text = read_resume(resume.filename, content, extension)
     if len(resume_text.strip()) < 40:
         raise HTTPException(status_code=422, detail="We couldn't find enough selectable text. If this is a scanned PDF, export a text-based copy and try again.")
     result = analyze(resume_text, job_description)

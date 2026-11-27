@@ -2,6 +2,8 @@ import { useRef, useState } from "react";
 
 const MAX_BYTES = 10 * 1024 * 1024;
 const ACCEPTED = [".pdf", ".docx", ".txt"];
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
+const ANALYZE_ENDPOINT = `${API_BASE_URL}/api/analyze`;
 const SAMPLE_JOB = `Backend Software Developer Intern\nWe are looking for an intern to help build and maintain backend services and product features. The role involves implementing REST APIs, working with databases, supporting deployment workflows, and collaborating with engineers to deliver reliable software.\nCore skills: Python, JavaScript, TypeScript, SQL, REST APIs, Git, Docker, MongoDB, CI/CD.\nPreferred skills: FastAPI, AWS, Pandas, and clear communication.`;
 
 function formatSize(bytes) {
@@ -122,7 +124,7 @@ function Results({ result, filename, onReset }) {
           ) : <p className="empty-copy">No recognized gaps to build a learning plan from yet.</p>}
         </aside>
       </div>
-      <div className="privacy-banner"><div><strong>Your resume stays on this page only.</strong><p>Clear the analysis when you’re finished. Clearpath doesn’t save resume files or analysis history.</p></div><button onClick={onReset}>Clear analysis</button></div>
+      <div className="privacy-banner"><div><strong>Your resume is processed in memory for this analysis.</strong><p>Clearpath does not write uploaded files, personal details, or reports to a database. Your browser keeps this result until you clear it or close the page.</p></div><button onClick={onReset}>Clear analysis</button></div>
       <p className="method-note method-note--footer">This is career guidance based on extracted text, not a hiring decision or a guarantee of ATS results. {result.method === "semantic-enhanced" ? "Related phrase matches are suggestions; review them before relying on the score." : "Install and enable the optional semantic model for related-phrase suggestions."}</p>
     </main>
   );
@@ -168,8 +170,8 @@ export default function App() {
       const form = new FormData();
       form.append("resume", file);
       form.append("job_description", jobDescription);
-      const response = await fetch("/api/analyze", { method: "POST", body: form, cache: "no-store" });
-      const payload = await response.json();
+      const response = await fetch(ANALYZE_ENDPOINT, { method: "POST", body: form, cache: "no-store" });
+      const payload = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(payload.detail || "We couldn't analyze that resume. Please try again.");
       setResult(payload);
       window.scrollTo({ top: 0, behavior: "smooth" });
@@ -210,7 +212,7 @@ export default function App() {
               {error && <p className="form-error" role="alert">{error}</p>}
               <div className="form-actions"><button className="analyze-button" type="submit" disabled={loading}>{loading ? <><span className="loading-dot" aria-hidden="true" /> Reading the details…</> : "See my match"}</button><button type="button" className="try-sample-button" onClick={loadExample} disabled={loading}>Try a sample</button></div>
               <details className="score-method"><summary>How the match score works</summary><p>Clearpath compares recognized skills in the job description with evidence in the resume. Required skills count twice as much as preferred skills. The score is guidance, not an employer or ATS decision.</p></details>
-              <p className="form-footnote">No account. No resume storage. Clear your analysis at any time.</p>
+              <p className="form-footnote">No account. In-memory processing. No resume storage or analysis history.</p>
             </form>
           </section>
           <div className="hero-index">01 <span>—</span> A clearer next step</div>
